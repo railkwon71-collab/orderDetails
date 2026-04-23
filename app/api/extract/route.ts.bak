@@ -1,0 +1,80 @@
+// 파일 위치: app/api/extract/route.ts
+import { NextResponse } from 'next/server';
+
+export async function POST(req: Request) {
+  try {
+    const body = await req.json();
+    const base64Image = body.image; 
+    const base64Data = base64Image.includes(',') ? base64Image.split(',')[1] : base64Image;
+
+    const prompt = `
+      첨부된 영수증/구매내역 이미지를 분석해서 아래 정보를 추출해줘.
+      반드시 JSON 형식으로만 대답하고, 다른 설명은 절대 하지 마.
+      {
+        "orderNumber": "주문번호",
+        "recipient": "수취인 이름",
+        "phone": "연락처",
+        "address": "배송지 주소",
+        "amount": "결제 금액",
+        "orderDate": "주문 날짜",
+        "productInfo": "상품 정보"
+      }
+    `;
+
+    const apiKey = process.env.GEMINI_API_KEY;
+
+    // 🚀 전략 1: 줄이 없는 빠르고 가벼운 1.5-flash-8b 모델로 변경했습니다.
+    const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash-8b:generateContent?key=${apiKey}`;
+    
+    const requestBody = JSON.stringify({
+      contents: [{ parts: [{ text: prompt }, { inline_data: { mime_type: "image/jpeg", data: base64Data } }] }]
+    });
+
+    // 🚀 전략 2: 503 에러 발생 시 알아서 3번까지 다시 찔러보는 자동 재시도 로직 (C#의 Polly와 같은 역할)
+    let retries = 3;
+    let response;
+    let data;
+
+    while (retries > 0) {
+      console.log(`==== 구글 서버 문 두드리는 중... (남은 재시도 횟수: ${retries}) ====`);
+      response = await fetch(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: requestBody
+      });
+
+      data = await response.json();
+
+      // 만약 503(서버 폭주) 에러라면?
+      if (response.status === 503 || (data.error && data.error.code === 503)) {
+        console.log("⚠️ 구글 서버가 바쁘다고 합니다. 1.5초 대기 후 다시 시도합니다...");
+        retries--;
+        if (retries === 0) break; // 기회 소진 시 반복문 탈출
+        
+        // 1.5초 대기 (C#의 Task.Delay(1500) 과 같습니다)
+        await new Promise(resolve => setTimeout(resolve, 1500));
+      } else {
+        // 503 에러가 아니면 무사히 통과! 반복문 탈출
+        break; 
+      }
+    }
+
+    // 3번 다 재시도했는데도 실패했다면 에러 반환
+    if (!response?.ok || data.error) {
+      console.error("🚨 구글 API 최종 에러:", data.error);
+      return NextResponse.json({ error: "인공지능 서버가 현재 너무 혼잡합니다. 잠시 후 다시 시도해주세요." }, { status: 500 });
+    }
+
+    // 성공적으로 데이터를 받았다면 변환
+    const aiTextResponse = data.candidates[0].content.parts[0].text;
+    const cleanJson = aiTextResponse.replace(/```json/g, '').replace(/```/g, '').trim();
+    const parsedData = JSON.parse(cleanJson);
+    
+    console.log("🎉 성공적으로 데이터를 추출했습니다!");
+    return NextResponse.json({ extractedData: parsedData });
+
+  } catch (error) {
+    console.error("🚨🚨 서버 내부 에러 🚨🚨", error);
+    return NextResponse.json({ error: "이미지 추출에 실패했습니다." }, { status: 500 });
+  }
+}
